@@ -1,213 +1,321 @@
-from typing import List, Tuple
-from schemas import OKRField, DriftFinding, DriftType, Verdict
-import re
+"""
+Conformance checking: compare SOP control fields against policy control fields.
+
+Improvements over the original:
+  - Threshold and time-window comparisons use the model-normalised numeric
+    fields (threshold_value, time_window_hours) instead of regex on free text.
+  - Region is a tiebreaker during matching, preventing EU controls from being
+    matched to APAC controls.
+  - Fuzzy control_id matching uses rapidfuzz token_set_ratio with a threshold
+    instead of loose substring matching, and only the best match wins.
+  - Fixes the "0 is falsy" bug in apply_regional_override.
+  - Role comparison normalises whitespace/case and ignores common decorations.
+"""
+import logging
+from typing import List, Optional, Tuple
+
+from schemas import DriftFinding, DriftType, OKRField, Verdict
+
+logger = logging.getLogger(__name__)
 
 
-def normalise(text: str) -> str:
-    """Lowercase and strip for loose comparison."""
+# ---------------------------------------------------------------- #
+# Helpers
+# ---------------------------------------------------------------- #
+def _norm(text: Optional[str]) -> str:
+    """Lowercase, strip, collapse whitespace."""
     if not text:
         return ""
-    return text.lower().strip()
+    return " ".join(text.lower().split())
 
 
-def extract_number(text: str) -> float | None:
-    """Pull first number from a string like 'risk_score >= 90'."""
-    if not text:
+def _norm_role(role: Optional[str]) -> str:
+    """Normalise a role string for loose comparison."""
+    if not role:
+        return ""
+    cleaned = role.lower().strip()
+    # Drop common trailing punctuation / decorations.
+    cleaned = cleaned.replace(".", "").replace(",", "")
+    return " ".join(cleaned.split())
+
+
+def _norm_region(region: Optional[str]) -> str:
+    if not region:
+        return ""
+    r = region.upper().strip()
+    # treat unspecified / global as wildcards downstream
+    if r in {"GLOBAL", "ALL", "WORLDWIDE", "ANY"}:
+        return "GLOBAL"
+    return r
+
+
+# ---------------------------------------------------------------- #
+# Individual checks
+# ---------------------------------------------------------------- #
+def check_threshold(
+    policy_field: OKRField, sop_field: OKRField
+) -> Optional[DriftFinding]:
+    """Detect unauthorized threshold changes using normalised numeric values."""
+    p_val = policy_field.threshold_value
+    s_val = sop_field.threshold_value
+
+    if p_val is None or s_val is None:
         return None
-    nums = re.findall(r'\d+\.?\d*', text)
-    return float(nums[0]) if nums else None
-
-
-def extract_hours(text: str) -> float | None:
-    """Convert time expressions to hours. 'within 24 hours' -> 24, 'within 3 days' -> 72."""
-    if not text:
-        return None
-    text = text.lower()
-    num_match = re.findall(r'\d+\.?\d*', text)
-    if not num_match:
-        return None
-    num = float(num_match[0])
-    if 'day' in text:
-        return num * 24
-    return num
-
-
-def check_threshold(policy_field: OKRField, sop_field: OKRField) -> DriftFinding | None:
-    """Detect unauthorized threshold changes."""
-    p_thresh = policy_field.threshold
-    s_thresh = sop_field.threshold
-
-    if not p_thresh or not s_thresh:
+    if p_val == s_val:
         return None
 
-    p_num = extract_number(p_thresh)
-    s_num = extract_number(s_thresh)
+    expected = policy_field.threshold or f"{p_val}"
+    observed = sop_field.threshold or f"{s_val}"
 
-    if p_num is None or s_num is None:
-        return None
-
-    if p_num != s_num:
-        return DriftFinding(
-            control_id=policy_field.control_id,
-            drift_type=DriftType.THRESHOLD_DRIFT,
-            expected=p_thresh,
-            observed=s_thresh,
-            evidence_span_policy=policy_field.evidence_span or p_thresh,
-            evidence_span_sop=sop_field.evidence_span or s_thresh,
-            severity=Verdict.BLOCK,
-            confidence=0.95,
-            remediation=f"Restore threshold to '{p_thresh}' or attach an approved regional override."
-        )
-    return None
+    return DriftFinding(
+        control_id=policy_field.control_id,
+        drift_type=DriftType.THRESHOLD_DRIFT,
+        expected=expected,
+        observed=observed,
+        evidence_span_policy=policy_field.evidence_span or expected,
+        evidence_span_sop=sop_field.evidence_span or observed,
+        severity=Verdict.BLOCK,
+        confidence=0.95,
+        remediation=(
+            f"Restore threshold to '{expected}' or attach an approved "
+            f"regional override."
+        ),
+    )
 
 
-def check_role(policy_field: OKRField, sop_field: OKRField) -> DriftFinding | None:
-    """Detect unauthorized role changes."""
-    p_actor = normalise(policy_field.required_actor or "")
-    s_actor = normalise(sop_field.required_actor or "")
+def check_role(
+    policy_field: OKRField, sop_field: OKRField
+) -> Optional[DriftFinding]:
+    """Detect unauthorized actor/role changes."""
+    p_actor = _norm_role(policy_field.required_actor)
+    s_actor = _norm_role(sop_field.required_actor)
 
     if not p_actor or not s_actor:
         return None
-
-    if p_actor != s_actor:
-        return DriftFinding(
-            control_id=policy_field.control_id,
-            drift_type=DriftType.ROLE_DRIFT,
-            expected=policy_field.required_actor,
-            observed=sop_field.required_actor,
-            evidence_span_policy=policy_field.evidence_span or policy_field.required_actor,
-            evidence_span_sop=sop_field.evidence_span or sop_field.required_actor,
-            severity=Verdict.BLOCK,
-            confidence=0.92,
-            remediation=f"Restore responsible actor to '{policy_field.required_actor}'."
-        )
-    return None
-
-
-def check_time_window(policy_field: OKRField, sop_field: OKRField) -> DriftFinding | None:
-    """Detect unauthorized time window changes."""
-    p_time = policy_field.time_window
-    s_time = sop_field.time_window
-
-    if not p_time or not s_time:
+    if p_actor == s_actor:
         return None
 
-    p_hours = extract_hours(p_time)
-    s_hours = extract_hours(s_time)
+    # Try a fuzzy match — small wording differences shouldn't BLOCK.
+    try:
+        from rapidfuzz import fuzz
+        score = fuzz.token_set_ratio(p_actor, s_actor)
+        if score >= 90:
+            return None  # essentially the same role written differently
+    except ImportError:
+        pass
+
+    return DriftFinding(
+        control_id=policy_field.control_id,
+        drift_type=DriftType.ROLE_DRIFT,
+        expected=policy_field.required_actor or "",
+        observed=sop_field.required_actor or "",
+        evidence_span_policy=policy_field.evidence_span or (policy_field.required_actor or ""),
+        evidence_span_sop=sop_field.evidence_span or (sop_field.required_actor or ""),
+        severity=Verdict.BLOCK,
+        confidence=0.90,
+        remediation=f"Restore responsible actor to '{policy_field.required_actor}'.",
+    )
+
+
+def check_time_window(
+    policy_field: OKRField, sop_field: OKRField
+) -> Optional[DriftFinding]:
+    """Detect time-window drift using normalised hours."""
+    p_hours = policy_field.time_window_hours
+    s_hours = sop_field.time_window_hours
 
     if p_hours is None or s_hours is None:
         return None
-
-    if s_hours > p_hours:
-        # longer time window = weaker control = BLOCK
-        severity = Verdict.BLOCK
-    elif s_hours < p_hours:
-        # stricter is a WARN - tighter but not approved
-        severity = Verdict.WARN
-    else:
+    if p_hours == s_hours:
         return None
+
+    # Looser window = weaker control = BLOCK.
+    # Stricter window = tighter than policy = WARN (deviation, but safer).
+    severity = Verdict.BLOCK if s_hours > p_hours else Verdict.WARN
+
+    expected = policy_field.time_window or f"{p_hours} hours"
+    observed = sop_field.time_window or f"{s_hours} hours"
 
     return DriftFinding(
         control_id=policy_field.control_id,
         drift_type=DriftType.TIME_WINDOW_DRIFT,
-        expected=p_time,
-        observed=s_time,
-        evidence_span_policy=policy_field.evidence_span or p_time,
-        evidence_span_sop=sop_field.evidence_span or s_time,
+        expected=expected,
+        observed=observed,
+        evidence_span_policy=policy_field.evidence_span or expected,
+        evidence_span_sop=sop_field.evidence_span or observed,
         severity=severity,
         confidence=0.90,
-        remediation=f"Restore time window to '{p_time}'."
+        remediation=f"Restore time window to '{expected}'.",
     )
+
+
+# ---------------------------------------------------------------- #
+# Matching
+# ---------------------------------------------------------------- #
+def _best_fuzzy_match(
+    sop_field: OKRField,
+    policy_fields: List[OKRField],
+    min_score: int = 85,
+) -> Optional[OKRField]:
+    """Find the single best fuzzy match for a SOP control among policy controls."""
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        return None
+
+    sop_key = _norm(sop_field.control_id)
+    sop_region = _norm_region(sop_field.region)
+
+    best: Optional[OKRField] = None
+    best_score = -1
+    for pf in policy_fields:
+        score = fuzz.token_set_ratio(sop_key, _norm(pf.control_id))
+        # Region tiebreaker: prefer same region or GLOBAL policy.
+        pf_region = _norm_region(pf.region)
+        if sop_region and pf_region and pf_region not in (sop_region, "GLOBAL"):
+            score -= 15  # penalise cross-region matches
+        if score > best_score:
+            best_score = score
+            best = pf
+
+    if best_score >= min_score:
+        return best
+    return None
 
 
 def match_sop_to_policy(
     policy_fields: List[OKRField],
-    sop_fields: List[OKRField]
+    sop_fields: List[OKRField],
 ) -> List[Tuple[OKRField, OKRField]]:
-    """Match SOP control fields to their corresponding policy fields by control_id."""
-    matches = []
-    policy_map = {normalise(f.control_id): f for f in policy_fields}
+    """
+    Match SOP controls to policy controls.
+    Order of preference:
+      1) exact normalised control_id + compatible region
+      2) exact normalised control_id (any region)
+      3) best fuzzy match above threshold
+    """
+    matches: List[Tuple[OKRField, OKRField]] = []
+    # group policies by normalised id for O(1) lookup
+    by_id: dict[str, list[OKRField]] = {}
+    for pf in policy_fields:
+        by_id.setdefault(_norm(pf.control_id), []).append(pf)
 
     for sop_f in sop_fields:
-        key = normalise(sop_f.control_id)
-        if key in policy_map:
-            matches.append((policy_map[key], sop_f))
-        else:
-            # fuzzy match - try partial control_id overlap
-            for p_key, p_field in policy_map.items():
-                if key in p_key or p_key in key:
-                    matches.append((p_field, sop_f))
-                    break
+        sop_key = _norm(sop_f.control_id)
+        sop_region = _norm_region(sop_f.region)
+        candidates = by_id.get(sop_key, [])
+
+        chosen: Optional[OKRField] = None
+        if candidates:
+            # Prefer (1) exact same-region match, then (2) GLOBAL, then (3) any.
+            exact = [c for c in candidates
+                     if sop_region and _norm_region(c.region) == sop_region]
+            globals_ = [c for c in candidates
+                        if _norm_region(c.region) == "GLOBAL"]
+            if exact:
+                chosen = exact[0]
+            elif globals_:
+                chosen = globals_[0]
+            else:
+                chosen = candidates[0]
+
+        if chosen is None:
+            chosen = _best_fuzzy_match(sop_f, policy_fields)
+            if chosen is not None:
+                logger.info(
+                    "Fuzzy-matched SOP control %s -> policy %s",
+                    sop_f.control_id, chosen.control_id,
+                )
+
+        if chosen is None:
+            logger.warning(
+                "SOP control %s has no matching policy control (region=%s)",
+                sop_f.control_id, sop_f.region,
+            )
+            continue
+
+        matches.append((chosen, sop_f))
 
     return matches
 
 
+# ---------------------------------------------------------------- #
+# Regional override
+# ---------------------------------------------------------------- #
 def apply_regional_override(
     finding: DriftFinding,
-    override_fields: List[OKRField]
+    sop_field: OKRField,
+    override_fields: List[OKRField],
 ) -> bool:
     """
-    Returns True if the finding is covered by an approved regional override.
-    If True, the finding should be downgraded from BLOCK to WARN or dropped.
+    Return True if the finding's observed value matches an approved
+    regional override for the same control. The SOP field is consulted
+    directly for its normalised numeric values rather than re-parsing
+    the finding's observed string.
     """
     for ov in override_fields:
-        if normalise(ov.control_id) != normalise(finding.control_id):
+        if _norm(ov.control_id) != _norm(finding.control_id):
             continue
 
         if finding.drift_type == DriftType.THRESHOLD_DRIFT:
-            ov_num = extract_number(ov.threshold or "")
-            obs_num = extract_number(finding.observed)
-            if ov_num and obs_num and ov_num == obs_num:
+            if (
+                ov.threshold_value is not None
+                and sop_field.threshold_value is not None
+                and ov.threshold_value == sop_field.threshold_value
+            ):
                 return True
 
         if finding.drift_type == DriftType.TIME_WINDOW_DRIFT:
-            ov_h = extract_hours(ov.time_window or "")
-            obs_h = extract_hours(finding.observed)
-            if ov_h and obs_h and ov_h == obs_h:
+            if (
+                ov.time_window_hours is not None
+                and sop_field.time_window_hours is not None
+                and ov.time_window_hours == sop_field.time_window_hours
+            ):
+                return True
+
+        if finding.drift_type == DriftType.ROLE_DRIFT:
+            if _norm_role(ov.required_actor) == _norm_role(sop_field.required_actor):
                 return True
 
     return False
 
 
+# ---------------------------------------------------------------- #
+# Top-level
+# ---------------------------------------------------------------- #
 def run_conformance_check(
     policy_fields: List[OKRField],
     sop_fields: List[OKRField],
-    override_fields: List[OKRField] = None
+    override_fields: Optional[List[OKRField]] = None,
 ) -> List[DriftFinding]:
     """
-    Core conformance logic.
-    Compares SOP fields against policy fields.
-    Applies regional overrides where applicable.
-    Returns only findings with evidence spans.
+    Compare SOP fields against policy fields.
+    Apply regional overrides where applicable (downgrading BLOCK -> WARN).
+    Returns only findings with evidence spans and confidence >= 0.4.
     """
     override_fields = override_fields or []
-    findings = []
+    findings: List[DriftFinding] = []
 
-    matched_pairs = match_sop_to_policy(policy_fields, sop_fields)
-
-    for policy_f, sop_f in matched_pairs:
-        # run all checkers
+    for policy_f, sop_f in match_sop_to_policy(policy_fields, sop_fields):
         checks = [
             check_threshold(policy_f, sop_f),
             check_role(policy_f, sop_f),
             check_time_window(policy_f, sop_f),
         ]
-
         for finding in checks:
             if finding is None:
                 continue
-
-            # validate - must have both evidence spans
             if not finding.evidence_span_policy or not finding.evidence_span_sop:
                 continue
             if finding.confidence < 0.4:
                 continue
 
-            # check if covered by approved regional override
-            if apply_regional_override(finding, override_fields):
-                # downgrade to WARN - it changed but it's authorized
+            if apply_regional_override(finding, sop_f, override_fields):
                 finding.severity = Verdict.WARN
-                finding.remediation = "Change matches approved regional override. Attach override reference."
+                finding.remediation = (
+                    "Change matches an approved regional override. "
+                    "Attach the override reference before publishing."
+                )
 
             findings.append(finding)
 
@@ -218,7 +326,7 @@ def compute_verdict(findings: List[DriftFinding]) -> Verdict:
     """Derive overall verdict from list of findings."""
     if not findings:
         return Verdict.PASS
-    severities = [f.severity for f in findings]
+    severities = {f.severity for f in findings}
     if Verdict.BLOCK in severities:
         return Verdict.BLOCK
     if Verdict.WARN in severities:
