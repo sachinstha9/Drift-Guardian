@@ -17,8 +17,6 @@ import os
 import re
 from typing import List
 
-import httpx
-
 from schemas import OKRField
 
 logger = logging.getLogger(__name__)
@@ -114,7 +112,15 @@ async def extract_okr_fields(text: str, source: str = "") -> List[OKRField]:
     """
     Extract structured OKR control fields from a policy or SOP document.
     Returns an empty list on any failure (caller must handle).
+
+    If LLM_MODE=mock (or the env hints at no backend), use the offline
+    deterministic extractor so the demo runs with zero infrastructure.
     """
+    if os.environ.get("LLM_MODE", "").lower() == "mock":
+        from mock_extraction import extract_okr_fields_mock
+
+        return extract_okr_fields_mock(text, source=source)
+
     if not text or not text.strip():
         logger.warning("extract_okr_fields called with empty text (source=%s)", source)
         return []
@@ -134,6 +140,8 @@ async def extract_okr_fields(text: str, source: str = "") -> List[OKRField]:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LLM_API_KEY}",
     }
+
+    import httpx  # local import: only needed for the real LLM path
 
     try:
         async with httpx.AsyncClient(timeout=LLM_TIMEOUT_S) as client:

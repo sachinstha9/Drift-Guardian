@@ -20,7 +20,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).parent.parent / "data"
+DATA_DIR = Path(__file__).parent / "data"
 POLICY_DIR = DATA_DIR / "policy_hierarchy"
 SOP_DIR = DATA_DIR / "sop_drafts"
 

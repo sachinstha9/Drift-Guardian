@@ -1,0 +1,21 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Set to "mock" for a zero-infrastructure demo; remove to use a real
+      # OpenAI-compatible LLM endpoint via LLM_ENDPOINT / LLM_MODEL.
+      LLM_MODE: "mock"
+      LOG_LEVEL: "INFO"
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+
+  ui:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      DRIFTGUARDIAN_API: "http://backend:8000"
+    depends_on:
+      - backend
+    command: streamlit run app.py --server.address 0.0.0.0 --server.port 8501

@@ -149,6 +149,52 @@ def check_time_window(
     )
 
 
+def check_step_omission(
+    policy_field: OKRField, sop_field: OKRField
+) -> Optional[DriftFinding]:
+    """
+    Detect omission/weakening of a mandatory control step.
+
+    The key signal in this benchmark: the policy requires review *before*
+    onboarding approval (a pre-approval gate). If the SOP turns that into a
+    post-approval / post-activation step, the gate has been removed — a serious
+    weakening even though threshold/role/time may be unchanged.
+    """
+    p_action = _norm(policy_field.required_action)
+    s_action = _norm(sop_field.required_action)
+
+    if not p_action or not s_action:
+        return None
+    if p_action == s_action:
+        return None
+
+    # Only flag when the meaning weakens: policy gates BEFORE approval, SOP
+    # moves it to AFTER. Pure rewording ("manual review" vs "review manually")
+    # with the same before/after sense should not BLOCK.
+    p_before = "before" in p_action
+    s_after = "after" in s_action or "post" in s_action
+
+    if not (p_before and s_after):
+        # action changed but not in the weakening direction we model — let the
+        # role/threshold/time checks handle other differences; skip here.
+        return None
+
+    return DriftFinding(
+        control_id=policy_field.control_id,
+        drift_type=DriftType.STEP_OMISSION,
+        expected=policy_field.required_action or "",
+        observed=sop_field.required_action or "",
+        evidence_span_policy=policy_field.evidence_span or (policy_field.required_action or ""),
+        evidence_span_sop=sop_field.evidence_span or (sop_field.required_action or ""),
+        severity=Verdict.BLOCK,
+        confidence=0.88,
+        remediation=(
+            "Restore the mandatory pre-approval review gate: review must occur "
+            "BEFORE onboarding approval, not after."
+        ),
+    )
+
+
 # ---------------------------------------------------------------- #
 # Matching
 # ---------------------------------------------------------------- #
@@ -301,6 +347,7 @@ def run_conformance_check(
             check_threshold(policy_f, sop_f),
             check_role(policy_f, sop_f),
             check_time_window(policy_f, sop_f),
+            check_step_omission(policy_f, sop_f),
         ]
         for finding in checks:
             if finding is None:

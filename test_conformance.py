@@ -8,9 +8,8 @@ the demo needs to land cleanly.
 import sys
 from pathlib import Path
 
-# Make the app/ package importable when running pytest from repo root.
-ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT / "app"))
+# Flat layout: modules live next to this test file.
+sys.path.insert(0, str(Path(__file__).parent))
 
 from conformance_checker import (  # noqa: E402
     apply_regional_override,
@@ -187,3 +186,31 @@ def test_override_with_zero_threshold_is_not_dropped():
     assert findings[0].severity == Verdict.WARN, (
         "Override with threshold_value=0 was incorrectly treated as falsy"
     )
+
+def test_step_omission_blocks_when_gate_moved_after_approval():
+    """Moving review from before -> after onboarding approval is a BLOCK."""
+    policy = [_policy_high_risk_review()]
+    policy[0].required_action = "manual review before onboarding approval"
+
+    sop_field = _policy_high_risk_review()
+    sop_field.required_action = "manual review after onboarding approval"
+    sop_field.evidence_span = "Review occurs after onboarding approval."
+
+    findings = run_conformance_check(policy, [sop_field], override_fields=[])
+    assert any(
+        f.drift_type == DriftType.STEP_OMISSION and f.severity == Verdict.BLOCK
+        for f in findings
+    )
+
+
+def test_step_omission_ignores_harmless_action_rewording():
+    """Same before/after sense, different wording, should not BLOCK as omission."""
+    policy = [_policy_high_risk_review()]
+    policy[0].required_action = "manual review before onboarding approval"
+
+    sop_field = _policy_high_risk_review()
+    sop_field.required_action = "manual EDD review before approving onboarding"
+    sop_field.evidence_span = "Review before approving onboarding."
+
+    findings = run_conformance_check(policy, [sop_field], override_fields=[])
+    assert not any(f.drift_type == DriftType.STEP_OMISSION for f in findings)
